@@ -1,0 +1,118 @@
+name: Full Stack Application Deployment Test
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  COMPOSE_PROJECT_NAME: github-actions-practice
+
+jobs:
+  deploy-and-test:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check Docker tools
+        run: |
+          docker --version
+          docker-compose --version
+
+      - name: Create .env file from GitHub Secrets
+        run: |
+          cat > .env <<EOF
+          DB_HOST=${{ secrets.DB_HOST }}
+          DB_PORT=${{ secrets.DB_PORT }}
+          DB_NAME=${{ secrets.DB_NAME }}
+          DB_USER=${{ secrets.DB_USER }}
+          DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+          APP_PORT=${{ secrets.APP_PORT }}
+          APP_SECRET=${{ secrets.APP_SECRET }}
+          API_KEY=${{ secrets.API_KEY }}
+          COMPOSE_PROJECT_NAME=${{ env.COMPOSE_PROJECT_NAME }}
+          EOF
+
+          mkdir -p artifacts
+          sed 's/=.*/=***/' .env > artifacts/env-redacted.txt
+          echo "Файл .env создан; значения секретов скрыты."
+
+      - name: Deploy with Docker Compose
+        run: |
+          docker-compose up -d --build
+          sleep 15
+          docker-compose ps
+
+      - name: Verify containers are running
+        run: |
+          docker-compose ps
+          if ! docker-compose ps | grep -Eiq "Up|running"; then
+            docker-compose logs
+            exit 1
+          fi
+
+      - name: Run application and database tests
+        run: |
+          echo "Проверка HTTP endpoint..."
+          curl --fail --silent --show-error "http://localhost:${{ secrets.APP_PORT }}/health"
+
+          echo "Проверка API..."
+          API_RESPONSE=$(curl --fail --silent --show-error "http://localhost:${{ secrets.APP_PORT }}/api/items/count")
+          WEB_COUNT=$(node -e "const x=JSON.parse(process.argv[1]); process.stdout.write(String(x.count))" "$API_RESPONSE")
+
+          echo "Получение количества записей непосредственно из PostgreSQL..."
+          DB_COUNT=$(docker-compose exec -T db psql -U "${{ secrets.DB_USER }}" -d "${{ secrets.DB_NAME }}" -t -c "SELECT COUNT(*) FROM items;" | tr -d '[:space:]')
+
+          echo "Количество записей в БД: $DB_COUNT"
+          echo "Количество записей через API: $WEB_COUNT"
+
+          if [ "$DB_COUNT" != "$WEB_COUNT" ]; then
+            echo "Ошибка: данные БД не совпадают с данными API."
+            exit 1
+          fi
+
+          echo "Проверки приложения и базы данных успешно пройдены."
+
+          cat > artifacts/test-report.md <<EOF
+          # Отчёт о тестировании
+          - Приложение: доступно
+          - Подключение к PostgreSQL: успешно
+          - Контейнеры: запущены
+          - Записей в БД: $DB_COUNT
+          - Записей через API: $WEB_COUNT
+          - Согласованность данных: успешно
+          EOF
+
+      - name: Save Docker logs and status
+        if: always()
+        run: |
+          docker-compose logs > artifacts/deployment-logs.txt 2>&1 || true
+          docker ps -a > artifacts/docker-ps.txt
+          docker images > artifacts/docker-images.txt
+          docker-compose ps > artifacts/compose-status.txt 2>&1 || true
+
+      - name: Upload deployment artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-artifacts
+          path: |
+            artifacts/env-redacted.txt
+            artifacts/test-report.md
+            artifacts/compose-status.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload Docker logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-logs
+          path: |
+            artifacts/deployment-logs.txt
+            artifacts/docker-ps.txt
+            artifacts/docker-images.txt
+          if-no-files-found: warn
+          retention-days: 30
